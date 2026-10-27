@@ -19,6 +19,24 @@ GID_KEYWORDS = setting("GID_KEYWORDS")         # gid of the "SEO Keywords" tab (
 LOCAL_FILE = os.environ.get("LOCAL_FILE", "")  # only for testing
 LOCAL_UPDATES = os.environ.get("LOCAL_UPDATES", "")  # only for testing
 
+def parse_dates(series):
+    """Reads dates safely whatever format the sheet exports (2026-10-09, 9/10/2026, 10/9/2026, 9-Oct-2026)."""
+    s = series.astype(str).str.strip()
+    out = pd.Series(pd.NaT, index=s.index, dtype="datetime64[ns]")
+    iso = s.str.match(r"^\d{4}-\d{1,2}-\d{1,2}")
+    out[iso] = pd.to_datetime(s[iso].str[:10], format="%Y-%m-%d", errors="coerce")
+    sl = s.str.match(r"^\d{1,2}/\d{1,2}/\d{4}")
+    if sl.any():
+        parts = s[sl].str.extract(r"^(\d{1,2})/(\d{1,2})/(\d{4})").astype(int)
+        # day first (India) unless the data proves month first (second number above 12)
+        month_first = parts[0].max() <= 12 and parts[1].max() > 12
+        out[sl] = pd.to_datetime(s[sl].str[:10].str.extract(r"^(\d{1,2}/\d{1,2}/\d{4})")[0],
+                                 format="%m/%d/%Y" if month_first else "%d/%m/%Y", errors="coerce")
+    rest = ~(iso | sl)
+    if rest.any():
+        out[rest] = pd.to_datetime(s[rest], errors="coerce")   # e.g. 9-Oct-2026
+    return out
+
 @st.cache_data(ttl=300)  # re-reads the sheet at most every 5 minutes
 def load():
     if LOCAL_FILE:
@@ -37,7 +55,7 @@ def load():
     for c in ["Comments", "Name"]:
         if c not in df.columns:
             df[c] = ""
-    df["Date"] = pd.to_datetime(df["Date"], errors="coerce", dayfirst=True)
+    df["Date"] = parse_dates(df["Date"])
     for c in ["SKUs Worked", "SKUs Completed", "Hours"]:
         df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0)
     stats = {"blank_dates": int(df["Date"].isna().sum())}
@@ -68,7 +86,7 @@ def read_tab(local, sheet, gid, key):
     return df
 
 def monday(s):
-    d = pd.to_datetime(s, errors="coerce", dayfirst=True)
+    d = parse_dates(s)
     return d - pd.to_timedelta(d.dt.weekday, unit="D")
 
 @st.cache_data(ttl=300)
@@ -99,7 +117,8 @@ def summarise(g):
 
 def worked_vs_done(t, x):
     d = t.reset_index()
-    enc = alt.X(f"{x}:T", title=None) if x == "Week Start" else alt.X(f"{x}:N", title=None, sort=None)
+    enc = (alt.X(f"{x}:O", timeUnit="yearmonthdate", title=None, axis=alt.Axis(format="%d %b", labelAngle=0))
+           if x == "Week Start" else alt.X(f"{x}:N", title=None, sort=None))
     tips = [x, "Worked", "Completed"]
     a = alt.Chart(d).mark_bar(opacity=0.35).encode(x=enc, y=alt.Y("Worked:Q", title="SKUs"), tooltip=tips)
     b = alt.Chart(d).mark_bar().encode(x=enc, y="Completed:Q", tooltip=tips)
@@ -197,6 +216,7 @@ with t5:
             st.bar_chart(hrs)
 
 with t6:
+    st.write(f"Rows read from the sheet: **{len(full)}**, across **{full['Date'].dt.date.nunique()}** different dates")
     st.write(f"Blank or unreadable date rows ignored: **{stats.get('blank_dates', 0)}**")
     st.write(f"Exact duplicate rows removed: **{stats.get('dups', 0)}**")
     st.write(f"Extra rows for the same person and date: **{stats.get('same_day_twice', 0)}**")
